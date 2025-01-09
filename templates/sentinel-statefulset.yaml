@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sentinel
+spec:
+  serviceName: sentinel
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sentinel
+  template:
+    metadata:
+      labels:
+        app: sentinel
+    spec:
+      initContainers:
+      - name: config
+        image: {{ .Values.redis.image }}
+        imagePullPolicy: Always
+        command: [ "sh", "-c" ]
+        args:
+          - |
+            REDIS_PASSWORD={{ .Values.redis.auth_pass }}
+            nodes=redis-0.redis,redis-1.redis,redis-2.redis
+            loop=$(echo $nodes | sed -e "s/,/\n/g")
+
+            # Waiting for all redises to come alive
+            hosts_cnt=0
+            for i in $loop
+            do
+              echo -n "Trying $i ... "
+              ping -4 -q -c1 -w5 -W5 $i > /dev/null
+              if [ $? -ne 0 ] ; then
+                echo "OFFLINE"
+                hosts_cnt=$((hosts_cnt+1))
+              fi
+            done
+
+            # If all redises are down - waiting for 1 min for a cluster rollout to finish
+            if [ $hosts_cnt -eq 3 ] ; then
+              echo "All redises offline, waiting to come up"
+              sleep 60
+            fi
+
+            # Get the master redis
+            for i in $loop
+            do
+                echo "finding master at $i"
+                MASTER=$(redis-cli --no-auth-warning --raw -h $i -a $REDIS_PASSWORD info replication | awk '{print $1}' | grep master_host: | cut -d ":" -f2)
+                if [ "$MASTER" = "" ]; then
+                    echo "no master found"
+                    MASTER=
+                else
+                    echo "found $MASTER"
+                    break
+                fi
+            done
+            echo "sentinel monitor mymaster $MASTER {{ .Values.redis.port }} 2" >> /tmp/master
+            echo "port {{ .Values.sentinel.port }}
+            sentinel resolve-hostnames yes
+            sentinel announce-hostnames yes
+            $(cat /tmp/master)
+            sentinel down-after-milliseconds mymaster 5000
+            sentinel failover-timeout mymaster 60000
+            sentinel parallel-syncs mymaster 1
+            sentinel auth-pass mymaster $REDIS_PASSWORD
+            " > /etc/redis/sentinel.conf
+            cat /etc/redis/sentinel.conf
+        volumeMounts:
+        - name: redis-config
+          mountPath: /etc/redis/
+      containers:
+      - name: sentinel
+        image: {{ .Values.redis.image }}
+        imagePullPolicy: Always
+        command: ["redis-sentinel"]
+        args: ["/etc/redis/sentinel.conf"]
+        ports:
+        - containerPort: {{ .Values.sentinel.port }}
+          name: sentinel
+        volumeMounts:
+        - name: redis-config
+          mountPath: /etc/redis/
+        - name: data
+          mountPath: {{ .Values.redis.data_dir }}
+      volumes:
+      - name: redis-config
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "localpath-deckhouse-system"
+      resources:
+        requests:
+          storage: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel
+spec:
+  clusterIP: None
+  ports:
+  - port: {{ .Values.sentinel.port }}
+    targetPort: {{ .Values.sentinel.port }}
+    name: sentinel
+  selector:
+    app: sentinel

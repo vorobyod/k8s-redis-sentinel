@@ -1,0 +1,9 @@
+---
+redis:
+  image: registry.local/library/redis:7.0.15-alpine
+  auth_pass: testing123
+  port: 6379
+  data_dir: /data
+
+sentinel:
+  port: 26379
